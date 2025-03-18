@@ -43,15 +43,15 @@ def test_combined_conditions():
 
 def test_edge_cases():
     """测试临界条件"""
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         AhoMatcher({""})
 
     matcher = AhoMatcher(use_logic=True)
     
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         matcher.find(["123"])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         matcher.build(["123"])
         
     with pytest.raises(ValueError):
