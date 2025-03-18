@@ -1,0 +1,15 @@
+[package]
+name = "kwmatcher"
+version = "0.1.0"
+edition = "2021"
+authors = ["Raven95676"]
+license = "MIT"
+
+
+[lib]
+name = "kwmatcher"
+crate-type = ["cdylib"]
+
+[dependencies]
+aho-corasick = "1.1.3"
+pyo3 = { version = "0.24.0", features = ["extension-module"] }
