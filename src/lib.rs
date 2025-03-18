@@ -6,13 +6,16 @@ use pyo3::{
 };
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 #[pyclass(name = "AhoMatcher")]
 struct AhoMatcher {
-    ac_impl: Option<AhoCorasick>,
-    patterns: Vec<String>,
-    pattern_components: Vec<(Vec<String>, Vec<Vec<String>>)>,
+    ac_impl: Option<Arc<AhoCorasick>>,
+    // 存储模式字符串的向量
+    patterns: Arc<Vec<String>>,
+    // 存储模式组件的向量，分为包含组和排除组
+    pattern_components: Arc<Vec<(Vec<String>, Vec<Vec<String>>)>>,
+    // 是否使用逻辑匹配
     use_logic: bool,
 }
 
@@ -21,6 +24,7 @@ impl AhoMatcher {
     #[new]
     #[pyo3(signature = (use_logic=None))]
     fn new(use_logic: Option<&Bound<'_, PyBool>>) -> PyResult<Self> {
+        // 如果提供了 use_logic 参数，则使用该参数的值，否则默认为 true
         let use_logic_value = match use_logic {
             Some(value) => value.is_true(),
             None => true,
@@ -28,24 +32,30 @@ impl AhoMatcher {
 
         Ok(Self {
             ac_impl: None,
-            patterns: Vec::new(),
-            pattern_components: Vec::new(),
+            patterns: Arc::new(Vec::new()),
+            pattern_components: Arc::new(Vec::new()),
             use_logic: use_logic_value,
         })
     }
 
     #[pyo3(text_signature = "(patterns: set)")]
     fn build(&mut self, py: Python<'_>, patterns: &Bound<'_, PySet>) -> PyResult<()> {
+        // 获取模式的数量
         let pattern_count = patterns.len();
-        let mut valid_patterns = Vec::with_capacity(pattern_count);
+        // 初始化存储有效模式的向量，预估大小为模式数量的两倍
+        let mut valid_patterns = Vec::with_capacity(pattern_count * 2);
+        // 初始化存储原始模式的向量
         let mut original_patterns = Vec::with_capacity(pattern_count);
+        // 初始化存储模式组件的向量
         let mut pattern_components = Vec::with_capacity(pattern_count);
 
+        // 从 Python 中收集模式
         let pattern_vec: Vec<String> = patterns
             .iter()
             .map(|pat| pat.extract::<&str>().map(String::from))
             .collect::<PyResult<Vec<_>>>()?;
 
+        // 并行处理模式，不持有GIL
         let processed = py.allow_threads(|| {
             pattern_vec
                 .into_par_iter()
@@ -55,10 +65,13 @@ impl AhoMatcher {
                     }
 
                     let orig_pattern = pattern.clone();
-                    let (valid_pats, components) = if self.use_logic {
-                        let mut segments = pattern.split('~');
-                        let positive_part = segments.next().unwrap_or("");
-
+                    
+                    if self.use_logic {
+                        // 使用～分割包含和排除部分
+                        let mut parts = pattern.splitn(2, '~');
+                        let positive_part = parts.next().unwrap_or("");
+                        
+                        // 处理包含组
                         let positive_terms: Vec<String> = positive_part
                             .split('&')
                             .map(str::trim)
@@ -72,114 +85,142 @@ impl AhoMatcher {
                             ));
                         }
 
-                        let negative_term_groups: Vec<Vec<String>> = segments
-                            .map(|segment| {
-                                segment
-                                    .split('&')
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from)
-                                    .collect()
-                            })
-                            .filter(|group: &Vec<String>| !group.is_empty())
-                            .collect();
+                        // 如果存在，处理排除组
+                        let negative_term_groups = if let Some(negative_part) = parts.next() {
+                            negative_part
+                                .split('~')
+                                .map(|segment| {
+                                    segment
+                                        .split('&')
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(String::from)
+                                        .collect::<Vec<String>>()
+                                })
+                                .filter(|group: &Vec<String>| !group.is_empty())
+                                .collect::<Vec<Vec<String>>>()
+                        } else {
+                            Vec::new()
+                        };
 
+                        // 收集所有有效模式
                         let mut valid = positive_terms.clone();
-                        negative_term_groups
-                            .iter()
-                            .for_each(|group| valid.extend(group.iter().cloned()));
-                        (valid, (positive_terms, negative_term_groups))
+                        for group in &negative_term_groups {
+                            valid.extend(group.iter().cloned());
+                        }
+                        
+                        Ok((orig_pattern, valid, (positive_terms, negative_term_groups)))
                     } else {
-                        (vec![pattern.clone()], (vec![pattern], vec![]))
-                    };
-
-                    Ok((orig_pattern, valid_pats, components))
+                        // 不使用逻辑匹配
+                        Ok((
+                            orig_pattern.clone(),
+                            vec![orig_pattern.clone()],
+                            (vec![orig_pattern], Vec::new()),
+                        ))
+                    }
                 })
                 .collect::<PyResult<Vec<_>>>()
         })?;
 
+        // 收集结果
         for (orig, valid, comp) in processed {
             original_patterns.push(orig);
             valid_patterns.extend(valid);
             pattern_components.push(comp);
         }
 
-        self.ac_impl = Some(py.allow_threads(|| {
+        // 在GIL之外构建AhoCorasick
+        let ac = py.allow_threads(|| {
             AhoCorasickBuilder::new()
                 .match_kind(MatchKind::LeftmostLongest)
                 .build(&valid_patterns)
                 .map_err(|e| PyValueError::new_err(e.to_string()))
-        })?);
-        self.patterns = original_patterns;
-        self.pattern_components = pattern_components;
+        })?;
+
+        self.ac_impl = Some(Arc::new(ac));
+        self.patterns = Arc::new(original_patterns);
+        self.pattern_components = Arc::new(pattern_components);
 
         Ok(())
     }
 
     #[pyo3(text_signature = "(haystack: str)")]
-    fn find(self_: PyRef<'_, Self>, haystack: &str) -> PyResult<Py<PySet>> {
-        let ac_impl = self_
-            .ac_impl
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("AhoCorasick not built. Call build() first."))?;
-
+    fn find<'py>(self_: PyRef<'_, Self>, haystack: &'py str) -> PyResult<Py<PySet>> {
         let py = self_.py();
+        
+        let ac_impl = match &self_.ac_impl {
+            Some(ac) => Arc::clone(ac),
+            None => return Err(PyValueError::new_err("AhoCorasick not built. Call build() first.")),
+        };
 
-        let matched_words = RwLock::new(HashSet::with_capacity(haystack.len() / 16));
-        py.allow_threads(|| {
-            let matches: Vec<_> = ac_impl
-                .try_find_iter(haystack.as_bytes())
-                .expect("Aho-Corasick matching failed")
-                .collect();
-
-            let mut locked_matches = matched_words.write().unwrap();
-            matches.iter().for_each(|m| {
-                locked_matches.insert(&haystack[m.start()..m.end()]);
-            });
-        });
-
-        let matched_words = matched_words.read().unwrap();
-
-        // 在 GIL 下提取需要的数据
-        let patterns = self_.patterns.clone();
-        let components = self_.pattern_components.clone();
+        let patterns = Arc::clone(&self_.patterns);
+        let components = Arc::clone(&self_.pattern_components);
         let use_logic = self_.use_logic;
 
-        let result_set = if use_logic {
-            let result = RwLock::new(HashSet::with_capacity(patterns.len()));
+        // 在GIL之外查找匹配项
+        let matched_words = py.allow_threads(move || {
+            let mut matches_set = HashSet::with_capacity(haystack.len() / 16);
+            
+            let matches = ac_impl
+                .try_find_iter(haystack.as_bytes())
+                .expect("Aho-Corasick matching failed");
+                
+            for m in matches {
+                matches_set.insert(&haystack[m.start()..m.end()]);
+            }
+            
+            matches_set
+        });
 
-            py.allow_threads(|| {
+        // 基于逻辑匹配处理结果
+        let result_set = py.allow_threads(move || {
+            if use_logic {
+                let result = RwLock::new(HashSet::with_capacity(patterns.len()));
+
                 components
                     .par_iter()
                     .enumerate()
                     .for_each(|(i, (pos_terms, neg_groups))| {
+                        // 检查包含组
                         let all_positive = pos_terms
-                            .par_iter()
-                            .all(|term| matched_words.contains(term as &str));
+                            .iter()
+                            .all(|term| matched_words.contains(term.as_str()));
 
-                        let no_negative = !neg_groups.par_iter().any(|group| {
-                            group
-                                .par_iter()
-                                .all(|term| matched_words.contains(term as &str))
-                        });
+                        // 检查包含组是否全部匹配
+                        if !all_positive {
+                            return;
+                        }
 
-                        if all_positive && no_negative {
-                            result.write().unwrap().insert(patterns[i].clone());
+                        // 检查排除组是否有完整匹配
+                        let has_negative_match = neg_groups
+                            .iter()
+                            .any(|group| {
+                                group
+                                    .iter()
+                                    .all(|term| matched_words.contains(term.as_str()))
+                            });
+                        
+                        // 如果没有排除组匹配，则添加结果
+                        if !has_negative_match {
+                            let mut lock = result.write().unwrap();
+                            lock.insert(patterns[i].clone());
                         }
                     });
-            });
-            result.into_inner().unwrap()
-        } else {
-            py.allow_threads(|| {
-                patterns
-                    .par_iter()
-                    .filter(|pattern| matched_words.contains(pattern as &str))
-                    .cloned()
-                    .collect()
-            })
-        };
 
-        Ok(PySet::new(py, result_set.iter().map(|s| PyString::new(py, s)))?.into())
+                result.into_inner().unwrap()
+            } else {
+                // 不使用逻辑匹配
+                patterns
+                    .iter()
+                    .filter(|pattern| matched_words.contains(pattern.as_str()))
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            }
+        });
+
+        // 将结果转换为pyset
+        let py_set = PySet::new(py, result_set.iter().map(|s| PyString::new(py, s)))?;
+        Ok(py_set.into())
     }
 }
 
