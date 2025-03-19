@@ -27,7 +27,7 @@ def test_chinese_matching():
 def test_combined_conditions():
     """测试组合条件匹配功能"""
     matcher = AhoMatcher(use_logic=True)
-    matcher.build({"apple&banana~orange", "苹果&香蕉~橘子", "tea&coffee~milk", "a&b&c~d"})
+    matcher.build({"apple&banana~orange", "苹果&香蕉~橘子", "tea&coffee~milk", "a&b&c~d","A&B~C&D&E~F&G&H&I&J"})
 
     assert matcher.find("apple banana") == {"apple&banana~orange"}
     assert matcher.find("apple banana orange") == set()
@@ -39,19 +39,24 @@ def test_combined_conditions():
 
     assert matcher.find("a b c") == {"a&b&c~d"}
     assert matcher.find("a b c d") == set()
+    assert matcher.find("A B C D E") == set()
+    assert matcher.find("A B F G H I J") == set()
+    assert matcher.find("A B C E F G H I") == {"A&B~C&D&E~F&G&H&I&J"}
+    assert matcher.find("A B C D E F G H I J") == set()
+
 
 
 def test_edge_cases():
     """测试临界条件"""
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         AhoMatcher({""})
 
     matcher = AhoMatcher(use_logic=True)
     
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         matcher.find(["123"])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         matcher.build(["123"])
         
     with pytest.raises(ValueError):
