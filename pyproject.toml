@@ -12,5 +12,10 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5"
+]
+
 [tool.maturin]
 python-source = "python"
